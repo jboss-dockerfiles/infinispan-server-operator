@@ -592,13 +592,20 @@ func applyLabels(ispn *Infinispan, envvar, annotationName string) error {
 	err := json.Unmarshal([]byte(labels), &labelMap)
 	if err == nil {
 		if len(labelMap) > 0 {
-			svcLabels := ""
 			if ispn.Labels == nil {
 				ispn.Labels = make(map[string]string)
 			}
-			for name, value := range labelMap {
-				ispn.Labels[name] = value
-				svcLabels = svcLabels + name + ","
+			keys := make([]string, len(labelMap))
+			i := 0
+			for k := range labelMap {
+				keys[i] = k
+				i++
+			}
+			sort.Strings(keys)
+			svcLabels := ""
+			for _, k := range keys {
+				ispn.Labels[k] = labelMap[k]
+				svcLabels = svcLabels + k + ","
 			}
 			if ispn.Annotations == nil {
 				ispn.Annotations = make(map[string]string)
