@@ -727,6 +727,13 @@ func upgradeRequired(infinispan *infinispanv1.Infinispan, podList *corev1.PodLis
 	// Get Infinispan image that the operator creates
 	desiredImage := consts.DefaultImageName
 
+	if infinispan.Spec.Upgrade != nil && infinispan.Spec.Upgrade.Strategy == infinispanv1.UpgradeStrategyManual {
+		// In Manual mode upgrade is triggered by the user changing infinispan.spec.Image field
+		// if that field is empty the operator default image is used (same as policy latest in this case)
+		if infinispan.Spec.Image != nil && *infinispan.Spec.Image != "" {
+			desiredImage = *infinispan.Spec.Image
+		}
+	}
 	// If the operator's default image differs from the pod's default image,
 	// schedule an upgrade by gracefully shutting down the current cluster.
 	return podDefaultImage != desiredImage, nil
