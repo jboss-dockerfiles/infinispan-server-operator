@@ -500,6 +500,19 @@ func (r *ReconcileInfinispan) Reconcile(request reconcile.Request) (reconcile.Re
 		if err != nil {
 			return reconcile.Result{}, err
 		}
+		// ISPN-13116 If xsite view has been formed, then we must perform state-transfer to all sites if a SFS recovery has occurred
+		if crossSiteViewCondition.Status == metav1.ConditionTrue {
+			podName := podList.Items[0].Name
+			logs, err := kubernetes.Logs(podName, infinispan.Namespace)
+			if err != nil {
+				log.Error(err, fmt.Sprintf("Unable to retrive logs for infinispan pod %s", podName))
+			}
+			if strings.Contains(logs, "ISPN000643") {
+				if err := cluster.XsitePushAllState(podName); err != nil {
+					log.Error(err, "Unable to push xsite state after SFS data recovery")
+				}
+			}
+		}
 		err = r.update(infinispan, func() {
 			infinispan.SetConditions([]infinispanv1.InfinispanCondition{*crossSiteViewCondition})
 		})
@@ -1284,7 +1297,7 @@ func (r *ReconcileInfinispan) reconcileGracefulShutdown(ispn *infinispanv1.Infin
 			}
 		}
 
-		return &reconcile.Result{}, r.update(ispn, func() {
+		return &reconcile.Result{Requeue: true}, r.update(ispn, func() {
 			if statefulSet.Status.CurrentReplicas == 0 {
 				ispn.SetCondition(infinispanv1.ConditionGracefulShutdown, metav1.ConditionTrue, "")
 				ispn.SetCondition(infinispanv1.ConditionStopping, metav1.ConditionFalse, "")
@@ -1314,28 +1327,39 @@ func (r *ReconcileInfinispan) reconcileGracefulShutdown(ispn *infinispanv1.Infin
 func (r *ReconcileInfinispan) gracefulShutdownReq(ispn *infinispanv1.Infinispan, podList *corev1.PodList,
 	logger logr.Logger, cluster ispn.ClusterInterface) (*reconcile.Result, error) {
 	logger.Info("Sending graceful shutdown request")
-	// send a graceful shutdown to the first ready pod
-	// if there's no ready pod we're in trouble
+	// Send a graceful shutdown to the first ready pod. If no pods are ready, then there's nothing to shutdown
 	for _, pod := range podList.Items {
 		if kube.IsPodReady(pod) {
-			err := cluster.GracefulShutdown(pod.GetName())
-			if err != nil {
-				logger.Error(err, "failed to exec shutdown command on pod")
-				continue
-			}
-			logger.Info("Executed graceful shutdown on pod: ", "Pod.Name", pod.Name)
+			if err := cluster.GracefulShutdown(pod.GetName()); err != nil {
+				logger.Error(err, "Error encountered on cluster shutdown")
 
-			if err := r.update(ispn, func() {
-				ispn.SetCondition(infinispanv1.ConditionStopping, metav1.ConditionTrue, "")
-				ispn.SetCondition(infinispanv1.ConditionWellFormed, metav1.ConditionFalse, "")
-			}); err != nil {
-				return &reconcile.Result{}, err
+				// ISPN-13141 causes GracefulShutdown to fail if there are issues with the server
+				logger.Info("Cluster Shutdown failed. Attempting to execute GracefulShutdownTask")
+				if err := cluster.GracefulShutdownTask(pod.GetName()); err != nil {
+					logger.Error(err, fmt.Sprintf("Error encountered using GracefulShutdownTask on pod %s", pod.Name))
+					continue
+				}
+			} else {
+				logger.Info("Executed graceful shutdown on pod: ", "Pod.Name", pod.Name)
+				break
 			}
-			// Stop the work and requeue until cluster is down
-			return &reconcile.Result{Requeue: true, RequeueAfter: time.Second}, nil
 		}
 	}
-	return nil, nil
+
+	logger.Info("GracefulShutdown executed. Deleting all pods")
+	deleteOptions := []client.DeleteAllOfOption{client.MatchingLabels(PodLabels(ispn.Name)), client.InNamespace(ispn.Namespace)}
+	if err := r.client.DeleteAllOf(context.TODO(), &corev1.Pod{}, deleteOptions...); err != nil && !errors.IsNotFound(err) {
+		logger.Error(err, "Error encountered deleting all Pods on GracefulShutdown")
+	}
+
+	if err := r.update(ispn, func() {
+		ispn.SetCondition(infinispanv1.ConditionStopping, metav1.ConditionTrue, "")
+		ispn.SetCondition(infinispanv1.ConditionWellFormed, metav1.ConditionFalse, "")
+	}); err != nil {
+		return &reconcile.Result{}, err
+	}
+	// Stop the work and requeue until cluster is down
+	return &reconcile.Result{Requeue: true, RequeueAfter: time.Second}, nil
 }
 
 // reconcileContainerConf reconcile the .Container struct is changed in .Spec. This needs a cluster restart
